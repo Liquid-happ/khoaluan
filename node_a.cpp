@@ -1,174 +1,113 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <PubSubClient.h>
 #include <esp_now.h>
-#include <WiFiManager.h> 
+#include <esp_wifi.h>
 #include "Adafruit_SHT31.h"
 
 #define MQ2_PIN     35
-#define BUZZER_PIN  18
+#define BAT_PIN     34
+#define ESP_NOW_CHANNEL 11
 
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
-/* --- CẤU HÌNH MQTT --- */
-const char* mqtt_server = "10.0.39.29"; 
-const int   mqtt_port   = 1883;
-const char* mqtt_user   = "quyet";
-const char* mqtt_pass   = "quyet123";
+/* --- ĐỊA CHỈ MAC CỦA NODE NHẬN --- */
+uint8_t macReceiver[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xE9, 0x58};
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-/* --- MAC ADDRESS CHO CÁC NODE PHỤ --- */
-uint8_t macESP2[6] = {0xD4, 0xE9, 0xF4, 0xA4, 0xF2, 0xB8};
-uint8_t macESP3[6] = {0xAC, 0x15, 0x18, 0xD7, 0xCD, 0x08};
-
-unsigned long lastSend = 0;
-const long interval = 10000;
-unsigned long lastReconnectAttempt = 0; 
-
-/* --- CẤU TRÚC GÓI TIN ESP-NOW --- */
+/* --- CẤU TRÚC GÓI TIN --- */
 typedef struct struct_message {
+    int id;
     float temp;
     float hum;
+    int gas;
+    float bat_vol;
 } struct_message;
 
-struct_message incomingReadings;
-float referenceTemp = 0.0;
-float referenceHum = 0.0;
+struct_message myData;
+esp_now_peer_info_t peerInfo;
 
-/* --- HÀM HIỆU CHỈNH NHIỆT ĐỘ --- */
-float calibrateTemp(float localT, float refT) {
-    if (refT == 0.0 || refT == -99.0) return localT; 
-    if (abs(localT - refT) > 2.0) return refT;
-    return localT;
-}
+unsigned long send_start_time = 0;
 
-/* --- ESP-NOW NHẬN DỮ LIỆU --- */
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-  if (len == 0) return;
-
-  Serial.printf("\n🔥 [DEBUG ESP-NOW] Nhận gói tin: %d bytes\n", len);
-
-  if (len == sizeof(struct_message)) {
-    memcpy(&incomingReadings, incomingData, sizeof(incomingReadings));
-    referenceTemp = incomingReadings.temp;
-    referenceHum = incomingReadings.hum;
-    
-    if (referenceTemp != -99.0) {
-      Serial.printf("📥 DỮ LIỆU CHUẨN -> Temp Node B: %.2f | Hum Node B: %.2f\n", referenceTemp, referenceHum);
-    } else {
-      Serial.println("⚠️ Node B báo lỗi cảm biến SHT30!");
-    }
-  } 
-  else {
-    char command[32];
-    memcpy(command, incomingData, len > 31 ? 31 : len);
-    command[len > 31 ? 31 : len] = '\0';
-
-    if (strcmp(command, "STOP_BUZZER") == 0) {
-      digitalWrite(BUZZER_PIN, LOW);
-      Serial.println("ESP-NOW: Đã nhận lệnh STOP_BUZZER!");
-    }
+/* --- CALLBACK KIỂM TRA TRẠNG THÁI GỬI & THỜI GIAN ACK --- */
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  unsigned long time_taken = millis() - send_start_time; // Tính thời gian phản hồi
+  
+  Serial.print("📡 Trạng thái truyền: ");
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.print("✅ THÀNH CÔNG");
+  } else {
+    Serial.print("❌ THẤT BẠI");
   }
-}
-
-/* --- MQTT CALLBACK --- */
-void callback(char* topic, byte* payload, unsigned int length) {
-  String message = "";
-  for (int i = 0; i < length; i++) message += (char)payload[i];
-
-  if (message == "STOP_BUZZER") {
-    digitalWrite(BUZZER_PIN, LOW);
-    const char* cmd = "STOP_BUZZER";
-    esp_now_send(macESP2, (uint8_t*)cmd, strlen(cmd) + 1);
-    esp_now_send(macESP3, (uint8_t*)cmd, strlen(cmd) + 1);
-  }
-}
-
-/* --- MQTT NON-BLOCKING --- */
-void connectMQTT() {
-  if (millis() - lastReconnectAttempt > 5000) {
-    lastReconnectAttempt = millis();
-    Serial.print("Attempting MQTT connection...");
-    
-    if (client.connect("ESP32_FIRE_NODE1", mqtt_user, mqtt_pass)) {
-      Serial.println("✅ connected to Broker");
-      client.subscribe("warehouse/alert");
-    } else {
-      Serial.print("failed, rc="); Serial.print(client.state());
-      Serial.println(" (Thử lại sau 5s...)");
-    }
-  }
+  Serial.printf(" | Thời gian ACK: %lu ms\n", time_taken);
+  Serial.println("=================================================\n");
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
 
   Wire.begin(21, 22);
-  if (!sht31.begin(0x44)) Serial.println("SHT30 not found on Node A!");
-
-  WiFiManager wm;
-  bool res = wm.autoConnect("ESP32_Config_SmartWarehouse", "12345678");
-
-  if(!res) {
-    Serial.println("Failed to connect WiFi or hit timeout");
-  } else {
-    Serial.println("✅ WiFi Connected via WiFiManager!");
-    WiFi.setSleep(false); 
-    Serial.printf(">>> Node A đang chạy ở Wi-Fi Channel: %d <<<\n", WiFi.channel());
+  if (!sht31.begin(0x44)) {
+    Serial.println("⚠️ Không tìm thấy cảm biến SHT31!");
   }
 
-  if (esp_now_init() != ESP_OK) Serial.println("Error initializing ESP-NOW");
-  esp_now_register_recv_cb(OnDataRecv);
+  // Khởi tạo Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
 
-  esp_now_peer_info_t peerInfo = {};
-  peerInfo.channel = WiFi.channel(); 
-  peerInfo.encrypt = false;
+  // Ép kênh Wi-Fi
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESP_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
 
-  memcpy(peerInfo.peer_addr, macESP2, 6); esp_now_add_peer(&peerInfo);
-  memcpy(peerInfo.peer_addr, macESP3, 6); esp_now_add_peer(&peerInfo);
+  // Khởi tạo ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ Lỗi khởi tạo ESP-NOW");
+    return;
+  }
 
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback);
+  // Đăng ký hàm Callback khi gửi xong
+  esp_now_register_send_cb(OnDataSent);
+
+  // Đăng ký Node Nhận
+  memcpy(peerInfo.peer_addr, macReceiver, 6);
+  peerInfo.channel = ESP_NOW_CHANNEL;  
+  peerInfo.encrypt = false; 
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("❌ Lỗi thêm thiết bị nhận");
+    return;
+  }
+  Serial.println("✅ HỆ THỐNG ESP32-1 ĐÃ SẴN SÀNG (KÊNH 11)!");
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!client.connected()) connectMQTT(); 
-    else client.loop(); 
-  }
+  // 1. Đọc cảm biến
+  float temp = sht31.readTemperature();
+  float hum = sht31.readHumidity();
+  int gas = analogRead(MQ2_PIN);
+  float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * 2; 
 
-  if (millis() - lastSend >= interval) {
-    lastSend = millis();
-    
-    float localTemp = sht31.readTemperature();
-    float hum  = sht31.readHumidity();
-    int   gas  = analogRead(MQ2_PIN);
+  if (isnan(temp)) temp = 0.0; // Reset về 0 nếu lỗi I2C
 
-    if (isnan(localTemp) || isnan(hum)) {
-      Serial.println("❌ Lỗi đọc SHT31 Node A!");
-      localTemp = 0.0; hum = 0.0;
-    }
+  // 2. In thông số ra màn hình để theo dõi
+  Serial.println("=================================================");
+  Serial.printf("📦 NODE 1 ĐANG ĐỌC DỮ LIỆU...\n");
+  Serial.printf("🌡 Nhiệt độ: %.2f °C | 💧 Độ ẩm: %.2f %%\n", temp, hum);
+  Serial.printf("💨 Khí Gas: %d       | 🔋 Pin: %.2f V\n", gas, bat_vol);
+  Serial.println("Đang gửi gói tin đi...");
 
-    float finalTemp = calibrateTemp(localTemp, referenceTemp);
-    if (gas > 600) digitalWrite(BUZZER_PIN, HIGH);
+  // 3. Gán dữ liệu vào struct
+  myData.id = 1;
+  myData.temp = temp;
+  myData.hum = hum;
+  myData.gas = gas;
+  myData.bat_vol = bat_vol;
 
-    if (WiFi.status() == WL_CONNECTED && client.connected()) {
-      char payload[200];
-      snprintf(payload, sizeof(payload),
-               "{\"temperature\":%.2f,\"local_temp\":%.2f,\"ref_temp\":%.2f,\"humidity\":%.2f,\"gas\":%d}",
-               finalTemp, localTemp, referenceTemp, hum, gas);
-      client.publish("esp32/sensor", payload);
-    }
+  // 4. Lưu mốc thời gian bắt đầu gửi và phát lệnh
+  send_start_time = millis();
+  esp_now_send(macReceiver, (uint8_t *) &myData, sizeof(myData));
 
-    Serial.println("\n------------------------------------");
-    Serial.printf("Temp: %.2f °C (Local: %.2f | Node B Ref: %.2f)\n", finalTemp, localTemp, referenceTemp);
-    Serial.printf("Humidity: %.2f %% | Gas: %d\n", hum, gas);
-    Serial.printf("Broker MQTT: %s\n", (client.connected() ? "Connected" : "Disconnected"));
-    Serial.println("------------------------------------");
-  }
+  // 5. CHỐT CHẶN: Tạm dừng hoàn toàn vòng lặp
+  // 5000 = 5 giây. Bạn có thể thay đổi số này để kéo dài hoặc rút ngắn thời gian giữa các lần gửi.
+  delay(5000); 
 }
