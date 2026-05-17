@@ -6,14 +6,15 @@
 #include <esp_task_wdt.h>
 #include "Adafruit_SHT31.h"
 
-#define MQ2_PIN     35
-#define BAT_PIN     34
+#define MQ2_PIN     34
+#define BAT_PIN     35
 #define BUZZER_PIN  18
 #define ESP_NOW_CHANNEL 11
 #define WDT_TIMEOUT 15
 
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
+/* --- ĐỊA CHỈ MAC --- */
 uint8_t macNode2[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xE9, 0x58}; 
 uint8_t macNode1[] = {0xAC, 0x15, 0x18, 0xD7, 0xCD, 0x08}; 
 
@@ -84,10 +85,12 @@ void loop() {
       float hum = sht31.readHumidity();
       int gas = analogRead(MQ2_PIN);
       
+      // --- ĐỌC ĐIỆN ÁP PIN CHUẨN ---
+      int adc_val = analogRead(BAT_PIN);
       float VOLTAGE_DIVIDER_RATIO = 3.0; 
-      float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO; 
-      if (bat_vol > 4.2) bat_vol = 4.2; 
-      if (bat_vol < 3.4) bat_vol = 3.4;
+      float CALIBRATION_FACTOR = 1.0; 
+      
+      float bat_vol = (adc_val / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO * CALIBRATION_FACTOR; 
 
       float bat_pct = ((bat_vol - 3.4) / (4.2 - 3.4)) * 100.0;
       if (bat_pct > 100.0) bat_pct = 100.0; 
@@ -106,7 +109,7 @@ void loop() {
           Serial.println("=================================================");
           Serial.printf("📦 NODE 3 ĐANG ĐỌC DỮ LIỆU...\n");
           Serial.printf("🌡 Nhiệt độ: %.2f °C | 💧 Độ ẩm: %.2f %%\n", temp, hum);
-          Serial.printf("💨 Khí Gas: %d       | 🔋 Pin: %.2f V (~%d%%)\n", gas, bat_vol, (int)bat_pct);
+          Serial.printf("💨 Khí Gas: %d       | 🔋 ADC: %d -> Pin: %.2f V (~%d%%)\n", gas, adc_val, bat_vol, (int)bat_pct);
 
           myData.id = 3; 
           myData.temp = temp;
