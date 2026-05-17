@@ -16,19 +16,19 @@ Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
 /* --- ĐỊA CHỈ MAC --- */
 uint8_t macNode2[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xE9, 0x58}; // Đích (Pi)
-uint8_t macNode3[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xF2, 0xB8}; // Cần đăng ký để giải mã Node 3
+uint8_t macNode3[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xF2, 0xB8}; // Cần đăng ký để giải mã
 
 const char *PMK_KEY = "SmartWareHouse88"; 
 const char *LMK_KEY = "KhoaLuanIoT2026X"; 
 
-/* --- ÉP KÍCH THƯỚC BỘ NHỚ CHỐNG LỆCH ID --- */
+/* --- KHÓA CHẶT 16 BYTE BỘ NHỚ CHO MỌI LOẠI CHIP ESP32 --- */
 typedef struct __attribute__((packed)) struct_message {
-    int id;
+    uint8_t id;
     float temp;
     float hum;
-    int gas;
+    uint16_t gas;
     float bat_vol;
-    bool is_relayed;
+    uint8_t is_relayed;
 } struct_message;
 
 struct_message myData;
@@ -37,7 +37,7 @@ esp_now_peer_info_t peerInfo;
 unsigned long send_start_time = 0;
 unsigned long last_read_time = 0;
 unsigned long last_send_time = 0;
-const unsigned long SEND_INTERVAL = 300000; // 5 phút = 300.000 ms
+const unsigned long SEND_INTERVAL = 60000; // 1 phút = 60.000 ms
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   unsigned long time_taken = millis() - send_start_time; 
@@ -46,15 +46,13 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.printf(" | Thời gian ACK: %lu ms\n", time_taken);
 }
 
-/* --- HÀM LẮNG NGHE & LÀM TRẠM CHUYỂN TIẾP --- */
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     if (len == sizeof(struct_message)) {
         struct_message relayData;
         memcpy(&relayData, incomingData, sizeof(relayData));
         
-        // Nếu ID không phải là 1 (tức là Node 3 đang nhờ)
-        if (relayData.id != 1) {
-            relayData.is_relayed = true;
+        if (relayData.id != 1) { // Không tự Relay chính mình
+            relayData.is_relayed = 1; // 1 = Đi đường vòng
             
             Serial.println("\n-------------------------------------------------");
             Serial.printf("🔄 ĐANG LÀM CẦU NỐI (RELAY) CHO NODE %d...\n", relayData.id);
@@ -68,19 +66,12 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
+  esp_task_wdt_init(WDT_TIMEOUT, true); esp_task_wdt_add(NULL);
 
-  esp_task_wdt_init(WDT_TIMEOUT, true);
-  esp_task_wdt_add(NULL);
+  Wire.begin(21, 22); sht31.begin(0x44);
 
-  Wire.begin(21, 22);
-  sht31.begin(0x44);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(ESP_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
@@ -111,15 +102,11 @@ void loop() {
       float hum = sht31.readHumidity();
       int gas = analogRead(MQ2_PIN);
       
-      // --- ĐỌC ĐIỆN ÁP PIN (MẠCH 200K - 100K) VÀ ÉP CỨNG MAX/MIN ---
-      float raw_bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * 3.0; 
-      
-      float bat_vol = raw_bat_vol;
-      // Ép cứng hiển thị: Nếu lớn hơn 4.2 thì giữ ở 4.2, nhỏ hơn 3.4 thì giữ ở 3.4
+      float VOLTAGE_DIVIDER_RATIO = 3.0; // Mạch phân áp 200k/100k
+      float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO; 
       if (bat_vol > 4.2) bat_vol = 4.2; 
       if (bat_vol < 3.4) bat_vol = 3.4;
 
-      // Tính phần trăm theo dải 3.4V (0%) đến 4.2V (100%)
       float bat_pct = ((bat_vol - 3.4) / (4.2 - 3.4)) * 100.0;
       if (bat_pct > 100.0) bat_pct = 100.0; 
       if (bat_pct < 0.0) bat_pct = 0.0;     
@@ -129,10 +116,9 @@ void loop() {
       if(temp >= 45.0 || gas >= 800) digitalWrite(BUZZER_PIN, HIGH);
       else digitalWrite(BUZZER_PIN, LOW);
 
-      // --- LOGIC HẸN GIỜ GỬI ---
       bool time_to_send = false;
       if (last_send_time == 0 || millis() - last_send_time >= SEND_INTERVAL) time_to_send = true;
-      if (temp >= 45.0 || gas >= 800) time_to_send = true; 
+      if (temp >= 45.0 || gas >= 800) time_to_send = true; // Nguy hiểm gửi luôn
 
       if (time_to_send) {
           Serial.println("=================================================");
@@ -145,7 +131,7 @@ void loop() {
           myData.hum = hum;
           myData.gas = gas;
           myData.bat_vol = bat_vol; 
-          myData.is_relayed = false;
+          myData.is_relayed = 0; // 0 = Đi trực tiếp
 
           send_start_time = millis();
           Serial.println("Đang gửi gói tin đi...");
