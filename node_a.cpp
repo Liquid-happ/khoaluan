@@ -102,9 +102,8 @@ void setup() {
 }
 
 void loop() {
-  esp_task_wdt_reset(); // Nạp lại Watchdog Timer chống treo mạch
+  esp_task_wdt_reset(); 
 
-  // Đọc cảm biến liên tục mỗi 2 giây
   if (millis() - last_read_time >= 2000) {
       last_read_time = millis();
 
@@ -112,28 +111,27 @@ void loop() {
       float hum = sht31.readHumidity();
       int gas = analogRead(MQ2_PIN);
       
-      // --- ĐỌC ĐIỆN ÁP PIN (MẠCH PHÂN ÁP 200K - 100K) ---
-      float VOLTAGE_DIVIDER_RATIO = 3.0; // Hệ số nhân cho mạch 200k/100k
-      float CALIBRATION_FACTOR = 1.0;    // Bù sai số ADC (chỉnh nếu cần)
+      // --- ĐỌC ĐIỆN ÁP PIN (MẠCH 200K - 100K) VÀ ÉP CỨNG MAX/MIN ---
+      float raw_bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * 3.0; 
       
-      float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO * CALIBRATION_FACTOR; 
-      
-      // Tính toán phần trăm (3.2V -> 0%, 4.2V -> 100%)
-      float bat_pct = ((bat_vol - 3.2) / (4.2 - 3.2)) * 100.0;
-      if (bat_pct > 100.0) bat_pct = 100.0; // Giới hạn trần
-      if (bat_pct < 0.0) bat_pct = 0.0;     // Giới hạn đáy
+      float bat_vol = raw_bat_vol;
+      // Ép cứng hiển thị: Nếu lớn hơn 4.2 thì giữ ở 4.2, nhỏ hơn 3.4 thì giữ ở 3.4
+      if (bat_vol > 4.2) bat_vol = 4.2; 
+      if (bat_vol < 3.4) bat_vol = 3.4;
+
+      // Tính phần trăm theo dải 3.4V (0%) đến 4.2V (100%)
+      float bat_pct = ((bat_vol - 3.4) / (4.2 - 3.4)) * 100.0;
+      if (bat_pct > 100.0) bat_pct = 100.0; 
+      if (bat_pct < 0.0) bat_pct = 0.0;     
 
       if (isnan(temp)) temp = 0.0;
 
-      // Cảnh báo còi tại chỗ KHÔNG ĐỢI 5 PHÚT
       if(temp >= 45.0 || gas >= 800) digitalWrite(BUZZER_PIN, HIGH);
       else digitalWrite(BUZZER_PIN, LOW);
 
       // --- LOGIC HẸN GIỜ GỬI ---
       bool time_to_send = false;
-      // Gửi lần đầu tiên HOẶC đã trôi qua 5 phút
       if (last_send_time == 0 || millis() - last_send_time >= SEND_INTERVAL) time_to_send = true;
-      // Gửi khẩn cấp bất chấp thời gian nếu có báo động
       if (temp >= 45.0 || gas >= 800) time_to_send = true; 
 
       if (time_to_send) {
@@ -146,7 +144,7 @@ void loop() {
           myData.temp = temp;
           myData.hum = hum;
           myData.gas = gas;
-          myData.bat_vol = bat_vol; // Vẫn gửi Volt lên Pi để đồng bộ code
+          myData.bat_vol = bat_vol; 
           myData.is_relayed = false;
 
           send_start_time = millis();
@@ -154,7 +152,7 @@ void loop() {
           esp_now_send(macNode2, (uint8_t *) &myData, sizeof(myData));
 
           Serial.println("=================================================\n");
-          last_send_time = millis(); // Chốt mốc thời gian đã gửi
+          last_send_time = millis(); 
       }
   }
 }
