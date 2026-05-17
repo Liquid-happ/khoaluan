@@ -3,111 +3,158 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
 #include "Adafruit_SHT31.h"
 
 #define MQ2_PIN     35
 #define BAT_PIN     34
+#define BUZZER_PIN  18
 #define ESP_NOW_CHANNEL 11
+#define WDT_TIMEOUT 15
 
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
-/* --- ĐỊA CHỈ MAC CỦA NODE NHẬN --- */
-uint8_t macReceiver[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xE9, 0x58};
+/* --- ĐỊA CHỈ MAC --- */
+uint8_t macNode2[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xE9, 0x58}; // Đích (Pi)
+uint8_t macNode3[] = {0xD4, 0xE9, 0xF4, 0xA4, 0xF2, 0xB8}; // Cần đăng ký để giải mã Node 3
 
-/* --- CẤU TRÚC GÓI TIN --- */
-typedef struct struct_message {
+const char *PMK_KEY = "SmartWareHouse88"; 
+const char *LMK_KEY = "KhoaLuanIoT2026X"; 
+
+/* --- ÉP KÍCH THƯỚC BỘ NHỚ CHỐNG LỆCH ID --- */
+typedef struct __attribute__((packed)) struct_message {
     int id;
     float temp;
     float hum;
     int gas;
     float bat_vol;
+    bool is_relayed;
 } struct_message;
 
 struct_message myData;
 esp_now_peer_info_t peerInfo;
 
 unsigned long send_start_time = 0;
+unsigned long last_read_time = 0;
+unsigned long last_send_time = 0;
+const unsigned long SEND_INTERVAL = 300000; // 5 phút = 300.000 ms
 
-/* --- CALLBACK KIỂM TRA TRẠNG THÁI GỬI & THỜI GIAN ACK --- */
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  unsigned long time_taken = millis() - send_start_time; // Tính thời gian phản hồi
-  
+  unsigned long time_taken = millis() - send_start_time; 
   Serial.print("📡 Trạng thái truyền: ");
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    Serial.print("✅ THÀNH CÔNG");
-  } else {
-    Serial.print("❌ THẤT BẠI");
-  }
+  Serial.print(status == ESP_NOW_SEND_SUCCESS ? "✅ THÀNH CÔNG" : "❌ THẤT BẠI");
   Serial.printf(" | Thời gian ACK: %lu ms\n", time_taken);
-  Serial.println("=================================================\n");
+}
+
+/* --- HÀM LẮNG NGHE & LÀM TRẠM CHUYỂN TIẾP --- */
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    if (len == sizeof(struct_message)) {
+        struct_message relayData;
+        memcpy(&relayData, incomingData, sizeof(relayData));
+        
+        // Nếu ID không phải là 1 (tức là Node 3 đang nhờ)
+        if (relayData.id != 1) {
+            relayData.is_relayed = true;
+            
+            Serial.println("\n-------------------------------------------------");
+            Serial.printf("🔄 ĐANG LÀM CẦU NỐI (RELAY) CHO NODE %d...\n", relayData.id);
+            
+            send_start_time = millis();
+            esp_now_send(macNode2, (uint8_t *) &relayData, sizeof(relayData));
+            Serial.println("-------------------------------------------------\n");
+        }
+    }
 }
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
 
   Wire.begin(21, 22);
-  if (!sht31.begin(0x44)) {
-    Serial.println("⚠️ Không tìm thấy cảm biến SHT31!");
-  }
+  sht31.begin(0x44);
 
-  // Khởi tạo Wi-Fi Station
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  delay(100);
 
-  // Ép kênh Wi-Fi
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(ESP_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
-  // Khởi tạo ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ Lỗi khởi tạo ESP-NOW");
-    return;
-  }
+  if (esp_now_init() != ESP_OK) return;
 
-  // Đăng ký hàm Callback khi gửi xong
+  esp_now_set_pmk((uint8_t *)PMK_KEY);
   esp_now_register_send_cb(OnDataSent);
-
-  // Đăng ký Node Nhận
-  memcpy(peerInfo.peer_addr, macReceiver, 6);
-  peerInfo.channel = ESP_NOW_CHANNEL;  
-  peerInfo.encrypt = false; 
   
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("❌ Lỗi thêm thiết bị nhận");
-    return;
-  }
-  Serial.println("✅ HỆ THỐNG ESP32-1 ĐÃ SẴN SÀNG (KÊNH 11)!");
+  peerInfo.channel = ESP_NOW_CHANNEL;  
+  peerInfo.encrypt = true; 
+  memcpy(peerInfo.lmk, LMK_KEY, 16);
+  
+  memcpy(peerInfo.peer_addr, macNode2, 6); esp_now_add_peer(&peerInfo);
+  memcpy(peerInfo.peer_addr, macNode3, 6); esp_now_add_peer(&peerInfo);
+
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("✅ ESP32-1 ĐÃ SẴN SÀNG (KIÊM RELAY)");
 }
 
 void loop() {
-  // 1. Đọc cảm biến
-  float temp = sht31.readTemperature();
-  float hum = sht31.readHumidity();
-  int gas = analogRead(MQ2_PIN);
-  float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * 2; 
+  esp_task_wdt_reset(); // Nạp lại Watchdog Timer chống treo mạch
 
-  if (isnan(temp)) temp = 0.0; // Reset về 0 nếu lỗi I2C
+  // Đọc cảm biến liên tục mỗi 2 giây
+  if (millis() - last_read_time >= 2000) {
+      last_read_time = millis();
 
-  // 2. In thông số ra màn hình để theo dõi
-  Serial.println("=================================================");
-  Serial.printf("📦 NODE 1 ĐANG ĐỌC DỮ LIỆU...\n");
-  Serial.printf("🌡 Nhiệt độ: %.2f °C | 💧 Độ ẩm: %.2f %%\n", temp, hum);
-  Serial.printf("💨 Khí Gas: %d       | 🔋 Pin: %.2f V\n", gas, bat_vol);
-  Serial.println("Đang gửi gói tin đi...");
+      float temp = sht31.readTemperature();
+      float hum = sht31.readHumidity();
+      int gas = analogRead(MQ2_PIN);
+      
+      // --- ĐỌC ĐIỆN ÁP PIN (MẠCH PHÂN ÁP 200K - 100K) ---
+      float VOLTAGE_DIVIDER_RATIO = 3.0; // Hệ số nhân cho mạch 200k/100k
+      float CALIBRATION_FACTOR = 1.0;    // Bù sai số ADC (chỉnh nếu cần)
+      
+      float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO * CALIBRATION_FACTOR; 
+      
+      // Tính toán phần trăm (3.2V -> 0%, 4.2V -> 100%)
+      float bat_pct = ((bat_vol - 3.2) / (4.2 - 3.2)) * 100.0;
+      if (bat_pct > 100.0) bat_pct = 100.0; // Giới hạn trần
+      if (bat_pct < 0.0) bat_pct = 0.0;     // Giới hạn đáy
 
-  // 3. Gán dữ liệu vào struct
-  myData.id = 1;
-  myData.temp = temp;
-  myData.hum = hum;
-  myData.gas = gas;
-  myData.bat_vol = bat_vol;
+      if (isnan(temp)) temp = 0.0;
 
-  // 4. Lưu mốc thời gian bắt đầu gửi và phát lệnh
-  send_start_time = millis();
-  esp_now_send(macReceiver, (uint8_t *) &myData, sizeof(myData));
+      // Cảnh báo còi tại chỗ KHÔNG ĐỢI 5 PHÚT
+      if(temp >= 45.0 || gas >= 800) digitalWrite(BUZZER_PIN, HIGH);
+      else digitalWrite(BUZZER_PIN, LOW);
 
-  // 5. CHỐT CHẶN: Tạm dừng hoàn toàn vòng lặp
-  // 5000 = 5 giây. Bạn có thể thay đổi số này để kéo dài hoặc rút ngắn thời gian giữa các lần gửi.
-  delay(5000); 
+      // --- LOGIC HẸN GIỜ GỬI ---
+      bool time_to_send = false;
+      // Gửi lần đầu tiên HOẶC đã trôi qua 5 phút
+      if (last_send_time == 0 || millis() - last_send_time >= SEND_INTERVAL) time_to_send = true;
+      // Gửi khẩn cấp bất chấp thời gian nếu có báo động
+      if (temp >= 45.0 || gas >= 800) time_to_send = true; 
+
+      if (time_to_send) {
+          Serial.println("=================================================");
+          Serial.printf("📦 NODE 1 ĐANG ĐỌC DỮ LIỆU...\n");
+          Serial.printf("🌡 Nhiệt độ: %.2f °C | 💧 Độ ẩm: %.2f %%\n", temp, hum);
+          Serial.printf("💨 Khí Gas: %d       | 🔋 Pin: %.2f V (~%d%%)\n", gas, bat_vol, (int)bat_pct);
+
+          myData.id = 1;
+          myData.temp = temp;
+          myData.hum = hum;
+          myData.gas = gas;
+          myData.bat_vol = bat_vol; // Vẫn gửi Volt lên Pi để đồng bộ code
+          myData.is_relayed = false;
+
+          send_start_time = millis();
+          Serial.println("Đang gửi gói tin đi...");
+          esp_now_send(macNode2, (uint8_t *) &myData, sizeof(myData));
+
+          Serial.println("=================================================\n");
+          last_send_time = millis(); // Chốt mốc thời gian đã gửi
+      }
+  }
 }
