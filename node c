@@ -6,8 +6,8 @@
 #include <esp_task_wdt.h>
 #include "Adafruit_SHT31.h"
 
-#define MQ2_PIN     35
-#define BAT_PIN     34
+#define MQ2_PIN     34
+#define BAT_PIN     35
 #define BUZZER_PIN  18
 #define ESP_NOW_CHANNEL 11
 #define WDT_TIMEOUT 15
@@ -80,13 +80,12 @@ void setup() {
   memcpy(peerInfo.peer_addr, macNode2, 6); esp_now_add_peer(&peerInfo);
   memcpy(peerInfo.peer_addr, macNode1, 6); esp_now_add_peer(&peerInfo);
   
-  Serial.println("✅ ESP32-3 ĐÃ SẴN SÀNG (MẠCH PHÂN ÁP CHUẨN 200K/100K)");
+  Serial.println("✅ ESP32-3 ĐÃ SẴN SÀNG");
 }
 
 void loop() {
-  esp_task_wdt_reset(); // Nạp lại Watchdog Timer chống treo mạch
+  esp_task_wdt_reset(); 
 
-  // Đọc cảm biến liên tục mỗi 2 giây
   if (millis() - last_read_time >= 2000) {
       last_read_time = millis();
       
@@ -94,27 +93,28 @@ void loop() {
       float hum = sht31.readHumidity();
       int gas = analogRead(MQ2_PIN);
       
-      // --- ĐỌC ĐIỆN ÁP PIN (MẠCH PHÂN ÁP 200K - 100K -> RATIO = 3.0) ---
-      float VOLTAGE_DIVIDER_RATIO = 3.0; 
-      float CALIBRATION_FACTOR = 1.0;    
-      float bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO * CALIBRATION_FACTOR; 
+      // --- ĐỌC ĐIỆN ÁP PIN (MẠCH 200K - 100K) VÀ ÉP CỨNG MAX/MIN ---
+      float raw_bat_vol = (analogRead(BAT_PIN) / 4095.0) * 3.3 * 3.0; 
 
-      // Quy đổi phần trăm (3.2V -> 0% | 4.2V -> 100%)
-      float bat_pct = ((bat_vol - 3.2) / (4.2 - 3.2)) * 100.0;
+      float bat_vol = raw_bat_vol;
+      // Ép cứng hiển thị: Nếu lớn hơn 4.2 thì giữ ở 4.2, nhỏ hơn 3.4 thì giữ ở 3.4
+      if (bat_vol > 4.2) bat_vol = 4.2; 
+      if (bat_vol < 3.4) bat_vol = 3.4;
+
+      // Tính phần trăm theo dải 3.4V (0%) đến 4.2V (100%)
+      float bat_pct = ((bat_vol - 3.4) / (4.2 - 3.4)) * 100.0;
       if (bat_pct > 100.0) bat_pct = 100.0; 
       if (bat_pct < 0.0) bat_pct = 0.0;     
 
       if (isnan(temp)) temp = 0.0;
 
-      // Cảnh báo còi báo động khẩn cấp tại chỗ tức thì
       if(temp >= 45.0 || gas >= 800) digitalWrite(BUZZER_PIN, HIGH);
       else digitalWrite(BUZZER_PIN, LOW);
 
-      // --- ĐIỀU KIỆN KÍCH HOẠT PHÁT SÓNG GỬI TIN ---
       bool force_send = false;
-      if (last_send_time == 0 || millis() - last_send_time >= SEND_INTERVAL) force_send = true; // Đủ chu kỳ 5 phút
-      if (abs(temp - last_sent_temp) >= 2.0) force_send = true; // Nhiệt độ biến động đột ngột đột biến
-      if (temp >= 45.0 || gas >= 800) force_send = true;        // Trạng thái nguy hiểm khẩn cấp
+      if (last_send_time == 0 || millis() - last_send_time >= SEND_INTERVAL) force_send = true; 
+      if (abs(temp - last_sent_temp) >= 2.0) force_send = true; 
+      if (temp >= 45.0 || gas >= 800) force_send = true;        
 
       if (force_send) {
           Serial.println("=================================================");
@@ -122,20 +122,18 @@ void loop() {
           Serial.printf("🌡 Nhiệt độ: %.2f °C | 💧 Độ ẩm: %.2f %%\n", temp, hum);
           Serial.printf("💨 Khí Gas: %d       | 🔋 Pin: %.2f V (~%d%%)\n", gas, bat_vol, (int)bat_pct);
 
-          myData.id = 3; // CHỐT CỨNG ID LÀ 3
+          myData.id = 3; 
           myData.temp = temp;
           myData.hum = hum;
           myData.gas = gas;
           myData.bat_vol = bat_vol;
-          myData.is_relayed = false; // Lúc đi từ Node 3 luôn là false
+          myData.is_relayed = false; 
 
-          // BƯỚC 1: Thử gửi thẳng đến Node 2 (Pi)
           send_start_time = millis();
           Serial.println("Đang gửi thẳng tới Node 2 (Pi)...");
           esp_now_send(macNode2, (uint8_t *) &myData, sizeof(myData));
-          delay(60); // Chờ 60ms để cập nhật trạng thái kết quả từ hàm OnDataSent
+          delay(60); 
           
-          // BƯỚC 2: Nếu gửi thẳng rớt mạng, tự động chuyển hướng đẩy qua Node 1 (Relay)
           if (!send_success) {
               Serial.println("⚠️ Node 2 mất kết nối! Tự động định tuyến qua Node 1...");
               esp_now_send(macNode1, (uint8_t *) &myData, sizeof(myData));
